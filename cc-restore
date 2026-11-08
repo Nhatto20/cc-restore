@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# Resume past Claude Code sessions from any project in new Windows Terminal tabs. See README.md.
+set -euo pipefail
+
+# WT profile whose look (opacity, colors) the new tabs take; empty = WT default profile.
+PROFILE=${CC_RESTORE_PROFILE-Windows PowerShell}
+PROFILE_ARGS=()
+if [ -n "$PROFILE" ]; then PROFILE_ARGS=(-p "$PROFILE"); fi
+DISTRO=${WSL_DISTRO_NAME:-Debian}
+
+PROJECTS=$HOME/.claude/projects
+SESSIONS=$HOME/.claude/sessions
+
+# A real user prompt: not meta, not tool_result-only, not a <command...> or interrupt marker.
+JQ_PROMPT='def prompt: select(.type == "user" and .isMeta != true)
+  | (.message.content | if type == "string" then . else ([.[]? | select(.type == "text").text] | join("")) end)
+  | select(length > 0 and (startswith("<") | not) and (startswith("[Request interrupted") | not));'
+
+# Sets RUN[id]=1 for live sessions and NAME[id] to the registry name (live file wins, else newest).
+declare -A RUN NAME LIVE_NAME
+load_registry() {
+  local pid sid upd name
+  local -a files=()
+  shopt -s nullglob; files=("$SESSIONS"/*.json); shopt -u nullglob
+  [ ${#files[@]} -gt 0 ] || return 0
+  while IFS=$'\t' read -r pid sid upd name; do
+    if kill -0 "$pid" 2>/dev/null; then RUN[$sid]=1; LIVE_NAME[$sid]=$name; else NAME[$sid]=$name; fi
+  # One jq for all files (spawns cost ~0.2 s each on WSL); fromjson? skips a half-written file.
+  done < <(awk 1 "${files[@]}" | jq -nrR '[inputs | fromjson? | [.pid, .sessionId, (.updatedAt // 0),
+    (if .nameSource == "derived" then "" else (.name // "") end)]] | sort_by(.[2]) | .[] | map(tostring) | join("\t")')
+}
+
+# <id> <mtime> <running> <cwd> <label>, newest first.
+list() {
+  load_registry
+  local mt f id reg='' order=''
+  local -a paths=()
+  while read -r mt f; do
+    paths+=("$f"); order+="${mt%.*}"$'\t'"$f"$'\n'
+  done < <(find "$PROJECTS" -mindepth 2 -maxdepth 2 -name '*.jsonl' -printf '%T@ %p\n' | sort -rn)
+  [ ${#paths[@]} -gt 0 ] || return 0
+  for id in "${!RUN[@]}" "${!NAME[@]}"; do
+    reg+="$id"$'\t'"${RUN[$id]:-0}"$'\t'"${LIVE_NAME[$id]-${NAME[$id]-}}"$'\n'
+  done
+  # grep -H prefixes each line with its path, so a single jq can group lines per transcript.
+  # tool_result lines are ~80% of the bytes and never prompts; drop them before jq parses.
+  { grep -HE '"type":"(user|custom-title|ai-title)"' "${paths[@]}" | grep -v '"tool_use_id"' || true; } \
+    | jq -nrR --arg order "$order" --arg reg "$reg" "$JQ_PROMPT"'
+      (reduce (inputs | index(":") as $i | [.[:$i], (.[$i + 1:] | fromjson?)] | select(length == 2)) as $x
+        ({}; .[$x[0]] += [$x[1]])) as $by
+      | ($reg | split("\n") | map(split("\t") | select(length == 3) | {key: .[0], value: .}) | from_entries) as $r
+      | $order | split("\n")[] | split("\t") | select(length == 2) | .[0] as $mt | .[1] as $f
+      | ($f | split("/") | last | rtrimstr(".jsonl")) as $id
+      | ($by[$f] // []) as $lines | ($lines | map(prompt)) as $p | select($p | length > 0)
+      | [$id, $mt, ($r[$id][1] // "0"), ($lines | map(.cwd // empty) | first // "-"),
+         ([($lines | map(select(.type == "custom-title").customTitle) | last),
+           ($lines | map(select(.type == "ai-title").aiTitle) | last), ($r[$id][2] // ""), $p[0]]
+          | map(select(. != null and . != "")) | first | gsub("[\n\t\r]+"; " ") | .[0:60])]
+      | join("\t")'
+}
+
+# Sets ARGV for session <id>; $2=1 adds --fork-session. wt.exe splits on ';', so escape it.
+mk_argv() {
+  local row cwd label esc='\;'
+  row=$(awk -F'\t' -v id="$1" '$1 == id' <<<"$ROWS")
+  [ -n "$row" ] || { echo "cc-restore: unknown session $1" >&2; return 1; }
+  IFS=$'\t' read -r _ _ _ cwd label <<<"$row"
+  label=${label:0:30}
+  # login shell: wsl.exe alone skips ~/.profile, so ~/.local/bin (claude) is not on PATH
+  local cmd="exec claude --resume $1"
+  if [ "$2" = 1 ]; then cmd+=" --fork-session"; fi
+  ARGV=(wt.exe -w 0 new-tab "${PROFILE_ARGS[@]}" --title "${label//;/$esc}" wsl.exe -d "$DISTRO" --cd "${cwd//;/$esc}" -- bash -lc "$cmd")
+}
+
+# <id> [mtime running cwd label]: header block, then the last prompts.
+preview() {
+  local f t state
+  f=$(find "$PROJECTS" -mindepth 2 -maxdepth 2 -name "$1.jsonl" | head -1)
+  if [ $# -ge 5 ]; then
+    printf -v t '%(%Y-%m-%d %H:%M)T' "$2"
+    state=$'\e[2mclosed\e[0m'; [ "$3" = 1 ] && state=$'\e[32m● running\e[0m'
+    printf '\e[1m%s\e[0m\n\e[36m%s\e[0m\n%s  ·  %s\n\e[2m%s\e[0m\n\n\e[2mRecent prompts\e[0m\n' "$5" "$4" "$t" "$state" "$1"
+  fi
+  grep -hE '"type":"user"' "$f" | jq -r "$JQ_PROMPT"'prompt | gsub("[\n\t\r]+"; " ") | .[0:400]' \
+    | tail -5 | sed $'s/^/\e[33m›\e[0m /; a\\\n'
+}
+
+# Short age: 5m, 3h, 2d, else MM-DD.
+age() {
+  local d=$((EPOCHSECONDS - $1))
+  if ((d < 3600)); then echo "$((d / 60))m"; elif ((d < 86400)); then echo "$((d / 3600))h"
+  elif ((d < 604800)); then echo "$((d / 86400))d"; else printf '%(%m-%d)T\n' "$1"; fi
+}
+
+picker() {
+  local id mt run cwd label proj mark ans cur=${CLAUDE_SESSION_ID:-}
+  local -a sel
+  # Visible field 2: status, age, project, label. Hidden fields 3-6 feed the preview.
+  while IFS=$'\t' read -r id mt run cwd label; do
+    mark=' '; [ "$run" = 1 ] && mark=$'\e[32m●\e[0m'
+    [ "$id" = "$cur" ] && label+=$' \e[2m(this session)\e[0m'
+    proj=${cwd##*/}; proj=${proj:-/}
+    printf '%s\t%s \e[2m%4s\e[0m  \e[36m%-22.22s\e[0m  %s\t%s\t%s\t%s\t%s\n' \
+      "$id" "$mark" "$(age "$mt")" "$proj" "$label" "$mt" "$run" "$cwd" "$label"
+  done <<<"$ROWS" | fzf --multi --ansi --delimiter '\t' --with-nth 2 \
+      --layout reverse --border rounded --border-label ' Claude sessions ' \
+      --prompt '  ' --pointer '▶' --marker '✓' --info inline \
+      --header $'TAB select · ENTER open · ESC quit   \e[32m●\e[0m running' \
+      --color 'bg:-1,bg+:236,hl:yellow,hl+:yellow,pointer:magenta,marker:green,border:240,label:cyan,header:244,prompt:cyan' \
+      --preview-window 'right,45%,wrap,border-left' \
+      --preview "$(readlink -f "$0") --preview {1} {3} {4} {5} {6}" | cut -f1 >"$SELFILE" || true
+  mapfile -t sel <"$SELFILE"
+  for id in "${sel[@]}"; do
+    run=$(awk -F'\t' -v id="$id" '$1 == id { print $3 }' <<<"$ROWS")
+    label=$(awk -F'\t' -v id="$id" '$1 == id { print $5 }' <<<"$ROWS")
+    ans=n
+    if [ "$run" = 1 ]; then read -rp "$label: [F]ork / [s]hared? " ans </dev/tty; fi
+    mk_argv "$id" "$([[ $ans == [sS]* ]] && echo 0 || echo "$run")"
+    "${ARGV[@]}"
+  done
+}
+
+mode=picker force=shared ids=()
+for a in "$@"; do
+  case $a in
+    --list) mode=list ;;
+    --dry-run) mode=dry ;;
+    --preview) mode=preview ;;
+    --tab) mode=tab ;;
+    -h|--help) mode=help ;;
+    --fork) force=fork ;;
+    --shared) force=shared ;;
+    *) ids+=("$a") ;;
+  esac
+done
+
+case $mode in
+  list) list ;;
+  preview) preview "${ids[@]}" ;;
+  # Picker in its own tab, for callers without a TTY (the /restore skill). No ';' here: wt.exe splits on it.
+  tab) wt.exe -w 0 new-tab "${PROFILE_ARGS[@]}" wsl.exe -d "$DISTRO" -- bash -lc cc-restore ;;
+  help)
+    cat <<'EOF'
+Usage: cc-restore            pick sessions (TAB select, ENTER open, ESC quit)
+       cc-restore --tab      open the picker in a new Windows Terminal tab
+       cc-restore --list     print sessions: id, mtime, running, cwd, label
+       cc-restore --dry-run [--fork|--shared] <id>...   print the wt.exe commands
+Env:   CC_RESTORE_PROFILE    Windows Terminal profile for new tabs (default "Windows PowerShell", empty = WT default)
+EOF
+    ;;
+  dry)
+    ROWS=$(list); out=
+    for id in "${ids[@]}"; do
+      mk_argv "$id" "$([ "$force" = fork ] && echo 1 || echo 0)"
+      out+="$(printf '%q' "${ARGV[0]}"; printf ' %q' "${ARGV[@]:1}")"$'\n'
+    done
+    printf '%s' "$out" ;;
+  picker)
+    printf '\e[2mLoading sessions…\e[0m\n'
+    ROWS=$(list)
+    [ -n "$ROWS" ] || exit 0
+    SELFILE=$(mktemp); trap 'rm -f "$SELFILE"' EXIT
+    picker ;;
+esac
