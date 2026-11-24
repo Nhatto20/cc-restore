@@ -107,6 +107,66 @@ out=$(run --dry-run ffffffff-0000-4000-8000-00000000000f 2>/dev/null); rc=$?
 check "dry-run unknown id: nonzero exit" 1 "$([ "$rc" -ne 0 ] && echo 1 || echo 0)"
 check "dry-run unknown id: nothing on stdout" "" "$out"
 
+# --- auto-fork, --new, session cap ---
+out=$(run --dry-run aaaaaaaa-0000-4000-8000-000000000001)
+check "dry-run default: running session forks" \
+  "$WT fix\\ the\\ login\\ bug wsl.exe -d Debian --cd /work/alpha -- bash -lc exec\\ claude\\ --resume\\ aaaaaaaa-0000-4000-8000-000000000001\\ --fork-session" "$out"
+
+out=$(run --dry-run --new "$fx" "hello world; bye"); rc=$?
+b64=$(printf '%s' 'hello world; bye' | base64 -w0)
+cmd=$(printf 'exec claude "$(base64 -d <<<%s)"' "$b64")
+check "new: exit 0" 0 "$rc"
+check "new: title=prompt cut to 30, ';' escaped, prompt via base64" \
+  "$WT hello\\ world\\\\\\;\\ bye wsl.exe -d Debian --cd $fx -- bash -lc $(printf '%q' "$cmd")" "$out"
+
+out=$(run --dry-run --new "$fx")
+check "new without prompt: plain claude, title=dir name" \
+  "$WT ${fx##*/} wsl.exe -d Debian --cd $fx -- bash -lc exec\\ claude" "$out"
+
+out=$(run --dry-run --new /no/such/dir 2>/dev/null); rc=$?
+check "new missing cwd: nonzero, nothing on stdout" "1|" "$([ "$rc" -ne 0 ] && echo 1 || echo 0)|$out"
+
+out=$(CC_RESTORE_MAX=1 run --dry-run --new "$fx" 2>/dev/null); rc=$?
+check "cap: refuses when running+new > CC_RESTORE_MAX" "1|" "$([ "$rc" -ne 0 ] && echo 1 || echo 0)|$out"
+
+out=$(CC_RESTORE_MAX=1 run --dry-run cccccccc-0000-4000-8000-000000000003 2>/dev/null); rc=$?
+check "cap: applies to resume too" "1|" "$([ "$rc" -ne 0 ] && echo 1 || echo 0)|$out"
+
+# --- trust list ---
+mkdir -p "$fx/bin" "$fx/tr/sub"
+printf '#!/bin/sh\necho "$@" >>"%s/wt.log"\n' "$fx" >"$fx/bin/wt.exe"; chmod +x "$fx/bin/wt.exe"
+echo '{"projects":{"/keep":{"hasTrustDialogAccepted":false,"x":1}},"other":2}' >"$fx/.claude.json"
+TF="$fx/.config/cc-restore/trusted"
+
+out=$(run --trust "$fx/tr" "$fx/tr"); rc=$?
+check "trust: exit 0, listed once" "0|$fx/tr" "$rc|$(cat "$TF")"
+out=$(run --trust /no/such/dir 2>/dev/null); rc=$?
+check "trust missing dir: nonzero" 1 "$([ "$rc" -ne 0 ] && echo 1 || echo 0)"
+
+run --dry-run --new "$fx/tr/sub" >/dev/null
+check "trust: dry-run does not write ~/.claude.json" "" "$(jq -r --arg d "$fx/tr/sub" '.projects[$d] // empty' "$fx/.claude.json")"
+
+PATH="$fx/bin:$PATH" run --new "$fx/tr/sub" "hi"; rc=$?
+check "trust: new under trusted dir runs wt.exe" "0|1" "$rc|$(wc -l <"$fx/wt.log")"
+check "trust: sets hasTrustDialogAccepted, keeps other keys" "true|1|2" \
+  "$(jq -r --arg d "$fx/tr/sub" '[.projects[$d].hasTrustDialogAccepted, .projects["/keep"].x, .other] | join("|")' "$fx/.claude.json")"
+
+PATH="$fx/bin:$PATH" run --new "$fx" "hi"
+check "trust: dir outside the list stays untrusted" "" "$(jq -r --arg d "$fx" '.projects[$d] // empty' "$fx/.claude.json")"
+
+# --- review fixes ---
+E=$(mktemp -d)
+out=$(env HOME="$E" "$TOOL" --dry-run --new "$E" x 2>&1); rc=$?
+check "new with no live session: exit 0" 0 "$rc"
+rm -rf "$E"
+
+out=$(cd "$fx/tr" && run --dry-run --new sub x)
+check "new: relative cwd resolved" 1 "$(grep -c -- "--cd $fx/tr/sub " <<<"$out")"
+
+out=$(run --dry-run --new "$fx" "-v")
+b64=$(printf '%s' ' -v' | base64 -w0)
+check "new: prompt starting with '-' gets a leading space" 1 "$(grep -c -F -- "$b64" <<<"$out")"
+
 echo "---"
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

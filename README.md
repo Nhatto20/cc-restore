@@ -18,12 +18,13 @@ git clone <repo-url> ~/cc-restore
 ~/cc-restore/install.sh
 ```
 
-`install.sh` tạo hai symlink, nên sau này chỉ cần `git pull` là cập nhật:
+`install.sh` tạo các symlink, nên sau này chỉ cần `git pull` là cập nhật:
 
 | symlink | trỏ tới |
 |---|---|
 | `~/.local/bin/cc-restore` | `~/cc-restore/cc-restore` |
 | `~/.claude/skills/restore` | `~/cc-restore/skill/restore` |
+| `~/.claude/skills/spawn` | `~/cc-restore/skill/spawn` |
 
 Script kiểm tra đủ lệnh cần thiết trước khi cài, và báo nếu `~/.local/bin` chưa có trong `PATH`.
 Nếu đã có thư mục `~/.claude/skills/restore` thật (không phải symlink), script đổi tên nó thành `restore.bak.<timestamp>`.
@@ -64,15 +65,26 @@ Khi mở lại một phiên đang chạy, script hỏi `[F]ork / [s]hared?`:
 ```text
 cc-restore --tab        mở picker trong một tab mới
 cc-restore --list       in danh sách phiên: id, mtime, running, cwd, label
-cc-restore --dry-run [--fork|--shared] <id>...   in lệnh wt.exe thay vì chạy
+cc-restore --open [--fork|--shared] <id>...   mở ngay, không picker (phiên đang chạy mặc định fork)
+cc-restore --new <cwd> [prompt]               mở phiên mới ngay
+cc-restore --dry-run --open|--new ...         in lệnh wt.exe thay vì chạy
 cc-restore --help
 ```
+
+## Để Claude tự mở phiên
+
+Skill `spawn` cho Claude gọi `--new` và `--open` mà không cần bạn duyệt.
+`install.sh` link skill này và thêm `Bash(cc-restore:*)` vào `permissions.allow` trong `~/.claude/settings.json`.
+`cc-restore --trust <thư mục>` ghi thư mục (và thư mục con) vào `~/.config/cc-restore/trusted`. Khi mở tab, `cc-restore` đặt `hasTrustDialogAccepted` cho thư mục đó trong `~/.claude.json`, nên tab không dừng ở hộp thoại "trust this folder". Thư mục chưa trust vẫn dừng ở hộp thoại, chờ bạn.
+Vì không ai duyệt, `CC_RESTORE_MAX` giới hạn số phiên chạy cùng lúc.
 
 ## Cấu hình
 
 | biến | mặc định | ý nghĩa |
 |---|---|---|
 | `CC_RESTORE_PROFILE` | `Windows PowerShell` | Profile Windows Terminal quyết định giao diện tab mới (độ mờ, màu). Đặt rỗng để dùng profile mặc định của WT. |
+| `CC_RESTORE_MAX` | `8` | Từ chối mở thêm khi số phiên đang chạy cộng số phiên sắp mở vượt mức này. |
+| `CC_RESTORE_TRUST_FILE` | `~/.config/cc-restore/trusted` | Danh sách thư mục được tự trust. |
 | `WSL_DISTRO_NAME` | do WSL tự đặt | Distro mà tab mới chạy `claude`. |
 
 Ví dụ, đặt trong `~/.bashrc`:

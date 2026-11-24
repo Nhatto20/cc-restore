@@ -23,7 +23,11 @@ cc-restore --list                   machine-readable session list, no fzf
 cc-restore --dry-run [--fork|--shared] <id>...   print the wt.exe command per id
 ```
 
-- `--dry-run` without `--fork` or `--shared` behaves like `--shared`: plain `--resume`, no `--fork-session`.
+- `--dry-run` without `--fork` or `--shared`: a running session forks, a closed one gets plain `--resume`.
+- `--open` is `--dry-run` that executes. `--new <cwd> [prompt]` starts a fresh session; the prompt is passed as base64 because `wt.exe` splits on `;`.
+- `--trust <dir>...` appends each realpath to `$CC_RESTORE_TRUST_FILE` (default `~/.config/cc-restore/trusted`), once.
+  A real `--open` or `--new` sets `projects[<cwd>].hasTrustDialogAccepted=true` in `~/.claude.json` when `<cwd>` is, or sits under, a listed dir. `--dry-run` writes nothing.
+- Both refuse (exit 1) when running sessions plus the new ones exceed `CC_RESTORE_MAX` (default 8).
 - `--dry-run` with an id that has no top-level transcript prints nothing on stdout, an error on stderr, and exits 1.
   Other ids in the same call are not printed either; the whole call fails.
 

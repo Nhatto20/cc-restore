@@ -10,6 +10,7 @@ DISTRO=${WSL_DISTRO_NAME:-Debian}
 
 PROJECTS=$HOME/.claude/projects
 SESSIONS=$HOME/.claude/sessions
+TRUST=${CC_RESTORE_TRUST_FILE:-$HOME/.config/cc-restore/trusted}
 
 # A real user prompt: not meta, not tool_result-only, not a <command...> or interrupt marker.
 JQ_PROMPT='def prompt: select(.type == "user" and .isMeta != true)
@@ -17,7 +18,7 @@ JQ_PROMPT='def prompt: select(.type == "user" and .isMeta != true)
   | select(length > 0 and (startswith("<") | not) and (startswith("[Request interrupted") | not));'
 
 # Sets RUN[id]=1 for live sessions and NAME[id] to the registry name (live file wins, else newest).
-declare -A RUN NAME LIVE_NAME
+declare -A RUN=() NAME=() LIVE_NAME=()
 load_registry() {
   local pid sid upd name
   local -a files=()
@@ -59,9 +60,16 @@ list() {
       | join("\t")'
 }
 
-# Sets ARGV for session <id>; $2=1 adds --fork-session. wt.exe splits on ';', so escape it.
+# Sets ARGV: new WT tab <title> in <cwd> running login-shell command <cmd>. wt.exe splits on ';', so escape it.
+mk_tab() {
+  local esc='\;'
+  TAB_CWD=$2
+  ARGV=(wt.exe -w 0 new-tab "${PROFILE_ARGS[@]}" --title "${1//;/$esc}" wsl.exe -d "$DISTRO" --cd "${2//;/$esc}" -- bash -lc "$3")
+}
+
+# Sets ARGV for session <id>; $2=1 adds --fork-session.
 mk_argv() {
-  local row cwd label esc='\;'
+  local row cwd label
   row=$(awk -F'\t' -v id="$1" '$1 == id' <<<"$ROWS")
   [ -n "$row" ] || { echo "cc-restore: unknown session $1" >&2; return 1; }
   IFS=$'\t' read -r _ _ _ cwd label <<<"$row"
@@ -69,7 +77,42 @@ mk_argv() {
   # login shell: wsl.exe alone skips ~/.profile, so ~/.local/bin (claude) is not on PATH
   local cmd="exec claude --resume $1"
   if [ "$2" = 1 ]; then cmd+=" --fork-session"; fi
-  ARGV=(wt.exe -w 0 new-tab "${PROFILE_ARGS[@]}" --title "${label//;/$esc}" wsl.exe -d "$DISTRO" --cd "${cwd//;/$esc}" -- bash -lc "$cmd")
+  mk_tab "$label" "$cwd" "$cmd"
+}
+
+# Sets ARGV for a fresh session in <cwd>; the prompt travels as base64 because wt.exe splits on ';'.
+mk_new() {
+  local dir cmd="exec claude" title prompt=${2-}
+  dir=$(realpath -e -- "$1" 2>/dev/null) || { echo "cc-restore: no such directory $1" >&2; return 1; }
+  title=${dir##*/}
+  # claude would read a leading '-' as an option
+  [[ $prompt == -* ]] && prompt=" $prompt"
+  if [ -n "$prompt" ]; then cmd+=" \"\$(base64 -d <<<$(printf %s "$prompt" | base64 -w0))\""; title=${prompt# }; title=${title:0:30}; fi
+  mk_tab "${title:-/}" "$dir" "$cmd"
+}
+
+# Pre-accept Claude's folder-trust prompt for <cwd> when it is, or sits under, a dir in the trust list.
+ensure_trust() {
+  local d tmp cj=$HOME/.claude.json ok=0
+  [ -f "$TRUST" ] && [ -f "$cj" ] || return 0
+  while IFS= read -r d; do
+    if [ -n "$d" ] && [[ $1 == "$d" || $1 == "$d"/* ]]; then ok=1; fi
+  done <"$TRUST"
+  [ $ok = 1 ] || return 0
+  # skip the rewrite when already set: live sessions also write this file
+  [ "$(jq -r --arg d "$1" '.projects[$d].hasTrustDialogAccepted' "$cj")" = true ] && return 0
+  tmp=$(mktemp "$cj.XXXXXX") || return 0
+  jq --arg d "$1" '.projects[$d].hasTrustDialogAccepted = true' "$cj" >"$tmp" && mv "$tmp" "$cj" || rm -f "$tmp"
+}
+
+# Refuse when <n> more tabs would exceed CC_RESTORE_MAX live sessions: nobody approves these opens.
+check_cap() {
+  local max=${CC_RESTORE_MAX:-8}
+  load_registry
+  if ((${#RUN[@]} + $1 > max)); then
+    echo "cc-restore: ${#RUN[@]} sessions running, limit $max (CC_RESTORE_MAX); not opening $1 more" >&2
+    return 1
+  fi
 }
 
 # <id> [mtime running cwd label]: header block, then the last prompts.
@@ -120,11 +163,14 @@ picker() {
   done
 }
 
-mode=picker force=shared ids=()
+mode=picker force= dry=0 ids=()
 for a in "$@"; do
   case $a in
     --list) mode=list ;;
-    --dry-run) mode=dry ;;
+    --dry-run) dry=1; [ "$mode" = picker ] && mode=open ;;
+    --open) mode=open ;;
+    --new) mode=new ;;
+    --trust) mode=trust ;;
     --preview) mode=preview ;;
     --tab) mode=tab ;;
     -h|--help) mode=help ;;
@@ -144,15 +190,38 @@ case $mode in
 Usage: cc-restore            pick sessions (TAB select, ENTER open, ESC quit)
        cc-restore --tab      open the picker in a new Windows Terminal tab
        cc-restore --list     print sessions: id, mtime, running, cwd, label
-       cc-restore --dry-run [--fork|--shared] <id>...   print the wt.exe commands
-Env:   CC_RESTORE_PROFILE    Windows Terminal profile for new tabs (default "Windows PowerShell", empty = WT default)
+       cc-restore --open [--fork|--shared] <id>...   open sessions now, no picker (running ones fork by default)
+       cc-restore --new <cwd> [prompt]               open a new session now
+       cc-restore --trust <dir>...                    skip the folder-trust prompt for <dir> and its subdirs when opening
+       --dry-run with --open or --new prints the wt.exe commands instead
+Env:   CC_RESTORE_TRUST_FILE trust list (default ~/.config/cc-restore/trusted)
+       CC_RESTORE_MAX        refuse to open when this many sessions already run (default 8)
+       CC_RESTORE_PROFILE    Windows Terminal profile for new tabs (default "Windows PowerShell", empty = WT default)
 EOF
     ;;
-  dry)
-    ROWS=$(list); out=
+  trust)
+    mkdir -p "${TRUST%/*}"
     for id in "${ids[@]}"; do
-      mk_argv "$id" "$([ "$force" = fork ] && echo 1 || echo 0)"
-      out+="$(printf '%q' "${ARGV[0]}"; printf ' %q' "${ARGV[@]:1}")"$'\n'
+      id=$(realpath -e -- "$id") || exit 1
+      grep -qxF -- "$id" "$TRUST" 2>/dev/null || echo "$id" >>"$TRUST"
+    done ;;
+  open|new)
+    out=
+    if [ $mode = new ]; then
+      check_cap 1
+      mk_new "${ids[0]:?cwd required}" "${ids[*]:1}" || exit 1
+      set -- new
+    else
+      ROWS=$(list); check_cap ${#ids[@]}
+      for id in "${ids[@]}"; do mk_argv "$id" 0 || exit 1; done
+      set -- "${ids[@]}"
+    fi
+    for id; do
+      if [ $mode = open ]; then
+        run=$(awk -F'\t' -v id="$id" '$1 == id { print $3 }' <<<"$ROWS")
+        mk_argv "$id" "$([ "${force:-$([ "$run" = 1 ] && echo fork)}" = fork ] && echo 1 || echo 0)"
+      fi
+      if [ $dry = 1 ]; then out+="$(printf '%q' "${ARGV[0]}"; printf ' %q' "${ARGV[@]:1}")"$'\n'; else ensure_trust "$TAB_CWD"; "${ARGV[@]}"; fi
     done
     printf '%s' "$out" ;;
   picker)
